@@ -8,6 +8,64 @@ from Bio.PDB.PDBParser import PDBParser
 from Bio.SeqUtils import seq1, seq3
 
 
+def compute_weights_and_score(
+    contact_matrix_bool: pd.DataFrame,
+    potential: pd.DataFrame,
+) -> tuple[pd.DataFrame, float]:
+    """Compute weighted matrix and final TCRen score.
+
+    Parameters:
+        contact_matrix_bool (pd.DataFrame): Boolean contact matrix. Rows are the
+            residues of the TCR chains, columns are the residues of the peptide.
+        potential (pd.DataFrame): Biophysics weight matrix, with TCR residues.
+    Returns:
+        Dict: A dictionary with the weighted contact matrix and the final score.
+    """
+    # Weights
+    contact_matrix_weighted = contact_matrix_bool.astype(float)
+    for i, (chaini, posi, resi) in enumerate(contact_matrix_weighted.index.values):
+        for j, (chainj, posj, resj) in enumerate(
+            contact_matrix_weighted.columns.values
+        ):
+            if contact_matrix_weighted.iloc[i, j]:
+                contact_matrix_weighted.iloc[i, j] *= potential.at[
+                    seq1(resi), seq1(resj)
+                ]
+
+    # Final score
+    score = contact_matrix_weighted.values.sum()
+
+    return contact_matrix_weighted, score
+
+
+def compute_weights_and_score_mutant(
+    contact_matrix_bool: pd.DataFrame,
+    potential: pd.DataFrame,
+    chain: str,
+    pos: int,
+    res_old: str,
+    res_new: str,
+) -> tuple[pd.DataFrame, float]:
+    contact_matrix_bool_mutant = contact_matrix_bool.copy()
+    idx = list(contact_matrix_bool_mutant.index).index(
+        (chain, int(pos), seq3(res_old).upper())
+    )
+    lvl = list(contact_matrix_bool_mutant.index.get_level_values("residue"))
+    lvl[idx] = seq3(res_new).upper()
+    contact_matrix_bool_mutant.index = pd.MultiIndex.from_arrays(
+        [
+            contact_matrix_bool_mutant.index.get_level_values("chain"),
+            contact_matrix_bool_mutant.index.get_level_values("pos"),
+            lvl,
+        ],
+        names=["chain", "pos", "residue"],
+    )
+    return compute_weights_and_score(
+        contact_matrix_bool_mutant,
+        potential,
+    )
+
+
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser("Emulate TCRen functionality")
@@ -111,24 +169,14 @@ if __name__ == "__main__":
     # Contact matrix
     contact_matrix_bool = dismin_idx.unstack(["chain2", "pos2", "residue2"])
 
-    # Weights
-    contact_matrix_weighted = contact_matrix_bool.astype(float)
-    for i, (chaini, posi, resi) in enumerate(contact_matrix_weighted.index.values):
-        for j, (chainj, posj, resj) in enumerate(
-            contact_matrix_weighted.columns.values
-        ):
-            if contact_matrix_weighted.iloc[i, j]:
-                contact_matrix_weighted.iloc[i, j] *= potential.at[
-                    seq1(resi), seq1(resj)
-                ]
+    contact_matrix_weighted, score = compute_weights_and_score(
+        contact_matrix_bool, potential
+    )
 
     # Array of contact weights
     contact_weights = contact_matrix_weighted.values.ravel()[
         contact_matrix_bool.values.ravel()
     ]
-
-    # Final score
-    score = contact_weights.sum()
 
     print(f"The TCRen score for this structure and epitope is: {score}.")
     t1 = time.time()
@@ -221,3 +269,62 @@ if __name__ == "__main__":
 
         plt.ion()
         plt.show()
+
+    # Compute scores for all single mutants, with the same contact matrix
+    t0 = time.time()
+    mutant_scores = []
+    for (chain, pos, res1), rows in dismin_filt.groupby(["chain", "pos", "residue"]):
+        # Only iterate over the TCR mutants here
+        for aa in potential.index:
+            if aa == res1:
+                continue
+
+            # For each peptide contact of this TCR residue, subtract the old aa and
+            # add the new one (we can because the scoring is linear)
+            delta_score = 0
+            for pos2, res2 in rows[["pos2", "residue2"]].values:
+                delta_score += (
+                    -potential.at[seq1(res1), seq1(res2)] + potential.at[aa, seq1(res2)]
+                )
+            # The new score is just the difference (again, linearity)
+            score_new = score + delta_score
+
+            mutation = f"{chain}:{res1}{pos}{aa}"
+            mutant_scores.append(
+                {
+                    "mutation": mutation,
+                    "chain": chain,
+                    "res_old": seq1(res1),
+                    "res_new": aa,
+                    "pos": pos,
+                    "score": score_new,
+                    "delta": delta_score,
+                }
+            )
+    mutant_scores = pd.DataFrame(mutant_scores)
+    mutant_scores.set_index("mutation", inplace=True)
+    t1 = time.time()
+    print("Assessing all single TCR mutants took {:.2f} seconds.".format(t1 - t0))
+
+    if args.plot:
+
+        print("Plot mutant delta scores")
+        fig, ax = plt.subplots(figsize=(3, 2))
+        ax.ecdf(mutant_scores["delta"], complementary=True)
+        ax.set_xlabel("$\\Delta$ score")
+        ax.set_ylabel("Cumulative fraction")
+        ax.grid(True)
+        fig.tight_layout()
+
+        plt.ion()
+        plt.show()
+
+    best_mutant = mutant_scores.nlargest(1, "delta").iloc[0]
+    contact_matrix_weighted_mutant, score_mutant = compute_weights_and_score_mutant(
+        contact_matrix_bool,
+        potential,
+        best_mutant["chain"],
+        best_mutant["pos"],
+        best_mutant["res_old"],
+        best_mutant["res_new"],
+    )
